@@ -21,3 +21,10 @@ funasr==1.1.5
 numpy==1.26.4
 pyyaml
 python-dotenv
+attrs
+lxml
+tabulate
+babel
+colorama
+jsonschema
+cython

@@ -3,9 +3,22 @@ import librosa
 import numpy as np
 import random
 import os
+import time
+import json
 from torch.utils.data import DataLoader
 from modules.audio import mel_spectrogram
 
+import oss2
+import io
+
+ak = ''
+sk = ''
+
+endpoint = "https://oss-cn-wulanchabu-internal.aliyuncs.com"
+region = "cn-wulanchabu"
+bucket_name = "pjlab-lingjun-mmsteel"
+auth = oss2.Auth(ak, sk)
+bucket = oss2.Bucket(auth, endpoint, bucket_name, region=region)
 
 duration_setting = {
     "min": 1.0,
@@ -25,10 +38,15 @@ class FT_Dataset(torch.utils.data.Dataset):
     ):
         self.data_path = data_path
         self.data = []
-        for root, _, files in os.walk(data_path):
-            for file in files:
-                if file.endswith((".wav", ".mp3", ".flac", ".ogg", ".m4a", ".opus")):
-                    self.data.append(os.path.join(root, file))
+        if "Emilia-101k" in self.data_path:
+            with open("/mnt/workspace/home/fangzihao/seed-vc/rp_metadata_cache_Emilia_ZH.json", "r", encoding="utf-8") as f:
+                temp_meta_cache = json.load(f)
+                self.data = list(temp_meta_cache.keys())
+        else:
+            for root, _, files in os.walk(data_path):
+                for file in files:
+                    if file.endswith((".wav", ".mp3", ".flac", ".ogg", ".m4a", ".opus")):
+                        self.data.append(os.path.join(root, file))
 
         self.sr = sr
         self.mel_fn_args = {
@@ -53,9 +71,15 @@ class FT_Dataset(torch.utils.data.Dataset):
         idx = idx % len(self.data)
         wav_path = self.data[idx]
         try:
-            speech, orig_sr = librosa.load(wav_path, sr=self.sr)
+            if "Emilia-101k" not in wav_path:
+                speech, orig_sr = librosa.load(wav_path, sr=self.sr)
+            else:
+                audio_bytes = bucket.get_object(wav_path)
+                audio = io.BytesIO(audio_bytes.read())
+                speech, orig_sr = librosa.load(audio, sr=self.sr)
         except Exception as e:
             print(f"Failed to load wav file with error {e}")
+            time.sleep(0.1)
             return self.__getitem__(random.randint(0, len(self)))
         if len(speech) < self.sr * duration_setting["min"] or len(speech) > self.sr * duration_setting["max"]:
             print(f"Audio {wav_path} is too short or too long, skipping")

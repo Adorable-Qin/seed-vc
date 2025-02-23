@@ -12,11 +12,14 @@ import torchaudio.compliance.kaldi as kaldi
 import glob
 from tqdm import tqdm
 import shutil
+import json
+from accelerate import Accelerator
 
 from modules.commons import recursive_munch, build_model, load_checkpoint
 from optimizers import build_optimizer
 from data.ft_dataset import build_ft_dataloader
 from hf_utils import load_custom_model_from_hf
+from modules.knn_vc import hubconf
 
 class Trainer:
     def __init__(self,
@@ -31,7 +34,8 @@ class Trainer:
                  max_epochs=1000,
                  device="cuda:0",
                  ):
-        self.device = device
+        self.accelerator = Accelerator()
+
         config = yaml.safe_load(open(config_path))
         self.log_dir = os.path.join(config['log_dir'], run_name)
         os.makedirs(self.log_dir, exist_ok=True)
@@ -58,12 +62,13 @@ class Trainer:
             num_workers=num_workers,
         )
         self.f0_condition = config['model_params']['DiT'].get('f0_condition', False)
-        self.build_sv_model(device, config)
-        self.build_semantic_fn(device, config)
+        self.build_sv_model(self.accelerator.device, config)
+        self.build_semantic_fn(self.accelerator.device, config)
         if self.f0_condition:
-            self.build_f0_fn(device, config)
-        self.build_converter(device, config)
-        self.build_vocoder(device, config)
+            self.build_f0_fn(self.accelerator.device, config)
+        self.build_converter(self.accelerator.device, config)
+        self.build_vocoder(self.accelerator.device, config)
+        self.build_knn_fn(self.accelerator.device)
 
         scheduler_params = {
             "warmup_steps": 0,
@@ -73,7 +78,7 @@ class Trainer:
         self.model_params = recursive_munch(config['model_params'])
         self.model = build_model(self.model_params, stage='DiT')
 
-        _ = [self.model[key].to(device) for key in self.model]
+        _ = [self.model[key].to(self.accelerator.device) for key in self.model]
         self.model.cfm.estimator.setup_caches(max_batch_size=batch_size, max_seq_length=8192)
 
         # initialize optimizers after preparing models for compatibility with FSDP
@@ -117,6 +122,37 @@ class Trainer:
             self.epoch, self.iters = 0, 0
             print("Failed to load any checkpoint, training from scratch.")
 
+        # prepare all components
+        self.model, self.optimizer, self.train_dataloader = self.accelerator.prepare(
+            self.model, self.optimizer, self.train_dataloader
+        )
+
+    def build_knn_fn(self, device):
+        self.knnvc_model = hubconf.knn_vc(
+            pretrained=True, 
+            progress=True, 
+            prematched=True, 
+            device=self.accelerator.device
+        )
+        self.knnvc_model.eval()
+        
+        self.knnvc_model = self.accelerator.prepare(self.knnvc_model)
+        self.knnvc_model = self.accelerator.unwrap_model(self.knnvc_model)
+
+        with open("/mnt/workspace/home/fangzihao/WHSP_LGU/spk.json", "r") as f:
+            spk_ = json.load(f)
+        
+        self.spk = []
+        for split in ["parallel", "nonparallel"]:
+            self.spk.extend(spk_[split])
+        
+        with open("/mnt/workspace/home/fangzihao/WHSP_LGU/spk2uid.json", "r") as f:
+            self.spk2uid = json.load(f)
+        
+        with open("/mnt/workspace/home/fangzihao/WHSP_LGU/uid2path.json", "r") as f:
+            self.uid2path = json.load(f)
+        self.path_root = "/mnt/workspace/home/fangzihao/WHSP_LGU"
+
     def build_sv_model(self, device, config):
         from modules.campplus.DTDNN import CAMPPlus
         self.campplus_model = CAMPPlus(feat_dim=80, embedding_size=192)
@@ -124,13 +160,19 @@ class Trainer:
         campplus_sd = torch.load(campplus_sd_path, map_location='cpu')
         self.campplus_model.load_state_dict(campplus_sd)
         self.campplus_model.eval()
-        self.campplus_model.to(device)
-        self.sv_fn = self.campplus_model
+        # self.campplus_model.to(device)
+        # self.sv_fn = self.campplus_model
+        # prepare
+        self.campplus_model = self.accelerator.prepare(self.campplus_model)
+        self.sv_fn = self.accelerator.unwrap_model(self.campplus_model)
 
     def build_f0_fn(self, device, config):
         from modules.rmvpe import RMVPE
         model_path = load_custom_model_from_hf("lj1995/VoiceConversionWebUI", "rmvpe.pt", None)
-        self.rmvpe = RMVPE(model_path, is_half=False, device=device)
+        self.rmvpe = RMVPE(model_path, is_half=False, device=self.accelerator.device)
+        # prepare
+        self.rmvpe.model = self.accelerator.prepare(self.rmvpe.model)
+        self.rmvpe.model = self.accelerator.unwrap_model(self.rmvpe.model)
         self.f0_fn = self.rmvpe
 
     def build_converter(self, device, config):
@@ -139,6 +181,9 @@ class Trainer:
         self.tone_color_converter = ToneColorConverter(config_converter, device=device)
         self.tone_color_converter.load_ckpt(ckpt_converter)
         self.tone_color_converter.model.eval()
+        # prepare
+        self.tone_color_converter.model = self.accelerator.prepare(self.tone_color_converter.model)
+        self.tone_color_converter.model = self.accelerator.unwrap_model(self.tone_color_converter.model)
         se_db_path = load_custom_model_from_hf("Plachta/Seed-VC", "se_db.pt", None)
         self.se_db = torch.load(se_db_path, map_location='cpu')
 
@@ -149,7 +194,7 @@ class Trainer:
             from modules.bigvgan import bigvgan
             self.bigvgan_model = bigvgan.BigVGAN.from_pretrained(vocoder_name, use_cuda_kernel=False)
             self.bigvgan_model.remove_weight_norm()
-            self.bigvgan_model = self.bigvgan_model.eval().to(device)
+            self.bigvgan_model = self.bigvgan_model.eval().to(self.accelerator.device)
             vocoder_fn = self.bigvgan_model
         elif vocoder_type == 'hifigan':
             from modules.hifigan.generator import HiFTGenerator
@@ -171,10 +216,13 @@ class Trainer:
         if speech_tokenizer_type == 'whisper':
             from transformers import AutoFeatureExtractor, WhisperModel
             whisper_model_name = config['model_params']['speech_tokenizer']['name']
-            self.whisper_model = WhisperModel.from_pretrained(whisper_model_name).to(device)
+            self.whisper_model = WhisperModel.from_pretrained(whisper_model_name).to(self.accelerator.device)
             self.whisper_feature_extractor = AutoFeatureExtractor.from_pretrained(whisper_model_name)
             # remove decoder to save memory
             del self.whisper_model.decoder
+            # prepare
+            self.whisper_model = self.accelerator.prepare(self.whisper_model)
+            self.whisper_model = self.accelerator.unwrap_model(self.whisper_model)
 
             def semantic_fn(waves_16k):
                 ori_inputs = self.whisper_feature_extractor(
@@ -185,7 +233,7 @@ class Trainer:
                 )
                 ori_input_features = self.whisper_model._mask_input_features(
                     ori_inputs.input_features, attention_mask=ori_inputs.attention_mask
-                ).to(device)
+                ).to(self.accelerator.device)
                 with torch.no_grad():
                     ori_outputs = self.whisper_model.encoder(
                         ori_input_features.to(self.whisper_model.encoder.dtype),
@@ -231,6 +279,17 @@ class Trainer:
             raise ValueError(f"Unsupported speech tokenizer type: {speech_tokenizer_type}")
         self.semantic_fn = semantic_fn
 
+    def get_matching_feats(self):
+        try:
+            rand_spk = random.choice(self.spk)
+            uids = self.spk2uid[rand_spk]
+            wav_paths = [os.path.join(self.path_root, self.uid2path[u]) for u in uids]
+            ref_wav_paths = [p for p in wav_paths if "whsp" in p]
+            matching_set = self.knnvc_model.get_matching_set(ref_wav_paths)
+        except Exception as e:
+            matching_set = self.get_matching_feats()
+        return matching_set
+
     def train_one_step(self, batch):
         waves, mels, wave_lengths, mel_input_length = batch
 
@@ -238,7 +297,7 @@ class Trainer:
         target_size = mels.size(2)
         target = mels
         target_lengths = mel_input_length
-
+        # print(f"wave's shape :{waves.shape}")
         # get speaker embedding
         if self.sr != 22050:
             waves_22k = torchaudio.functional.resample(waves, self.sr, 22050)
@@ -246,25 +305,50 @@ class Trainer:
         else:
             waves_22k = waves
             wave_lengths_22k = wave_lengths
-        se_batch = self.tone_color_converter.extract_se(waves_22k, wave_lengths_22k)
 
-        ref_se_idx = torch.randint(0, len(self.se_db), (B,))
-        ref_se = self.se_db[ref_se_idx].to(self.device)
+        waves_22k, wave_lengths_22k = (
+            waves_22k.to(self.accelerator.device),
+            wave_lengths_22k.to(self.accelerator.device)
+        )
+        
+        waves_16k = torchaudio.functional.resample(waves, self.sr, 16000)
+        wave_lengths_16k = (wave_lengths.float() * 16000 / self.sr).long()
 
-        # convert
-        converted_waves_22k = self.tone_color_converter.convert(
-            waves_22k, wave_lengths_22k, se_batch, ref_se
-        ).squeeze(1)
+        waves_16k, wave_lengths_16k = (
+                waves_16k.to(self.accelerator.device),
+                wave_lengths_16k.to(self.accelerator.device)
+            )
+        
+        use_whsp = False
+        if random.random() > 0.5:  # use original audio
+            se_batch = self.tone_color_converter.extract_se(waves_22k, wave_lengths_22k)
+
+            ref_se_idx = torch.randint(0, len(self.se_db), (B,))
+            ref_se = self.se_db[ref_se_idx].to(self.accelerator.device)
+
+            # convert
+            converted_waves_22k = self.tone_color_converter.convert(
+                waves_22k, wave_lengths_22k, se_batch, ref_se
+            ).squeeze(1)
+        else:   # use pseudo-whisper
+            use_whsp = True
+            query_seq = [self.knnvc_model.get_features(f, isQuery=True) for f in waves_16k]
+            matching_set = self.get_matching_feats()
+                
+            converted_waves_list = [self.knnvc_model.match(q, matching_set, topk=4).unsqueeze(0) for q in query_seq]
+            converted_waves_16k = torch.cat(converted_waves_list, dim=0)
+            converted_waves_22k = converted_waves_16k
+            # print(f"converted: {converted_waves_16k.shape}")
 
         if self.sr != 22050:
             converted_waves = torchaudio.functional.resample(converted_waves_22k, 22050, self.sr)
         else:
             converted_waves = converted_waves_22k
 
-        waves_16k = torchaudio.functional.resample(waves, self.sr, 16000)
-        wave_lengths_16k = (wave_lengths.float() * 16000 / self.sr).long()
-        converted_waves_16k = torchaudio.functional.resample(converted_waves, self.sr, 16000)
+        if not use_whsp:
+            converted_waves_16k = torchaudio.functional.resample(converted_waves, self.sr, 16000)
 
+        converted_waves_16k = converted_waves_16k.to(self.accelerator.device)
         # extract S_alt (perturbed speech tokens)
         S_ori = self.semantic_fn(waves_16k)
         S_alt = self.semantic_fn(converted_waves_16k)
@@ -331,9 +415,13 @@ class Trainer:
         )
 
         self.optimizer.zero_grad()
-        loss_total.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.cfm.parameters(), 10.0)
-        torch.nn.utils.clip_grad_norm_(self.model.length_regulator.parameters(), 10.0)
+        # loss_total.backward()
+        # torch.nn.utils.clip_grad_norm_(self.model.cfm.parameters(), 10.0)
+        # torch.nn.utils.clip_grad_norm_(self.model.length_regulator.parameters(), 10.0)
+        self.accelerator.backward(loss_total)
+        if self.accelerator.sync_gradients:
+            self.accelerator.clip_grad_norm_(self.model.cfm.parameters(), 10.0)
+            self.accelerator.clip_grad_norm_(self.model.length_regulator.parameters(), 10.0)
         self.optimizer.step('cfm')
         self.optimizer.step('length_regulator')
         self.optimizer.scheduler(key='cfm')
@@ -344,23 +432,25 @@ class Trainer:
     def train_one_epoch(self):
         _ = [self.model[key].train() for key in self.model]
         for i, batch in enumerate(tqdm(self.train_dataloader)):
-            batch = [b.to(self.device) for b in batch]
+            # batch = [b.to(self.device) for b in batch]
             loss = self.train_one_step(batch)
             self.ema_loss = (
                 self.ema_loss * self.loss_smoothing_rate + loss * (1 - self.loss_smoothing_rate)
                 if self.iters > 0 else loss
             )
-            if self.iters % self.log_interval == 0:
+            if self.accelerator.is_main_process and self.iters % self.log_interval == 0:
                 print(f"epoch {self.epoch}, step {self.iters}, loss: {self.ema_loss}")
-            self.iters += 1
+
+            self.accelerator.wait_for_everyone()
+            if self.accelerator.is_main_process:
+                self.iters += 1
 
             if self.iters >= self.max_steps:
                 break
 
             if self.iters % self.save_interval == 0:
-                print('Saving..')
                 state = {
-                    'net': {key: self.model[key].state_dict() for key in self.model},
+                    'net': {key: self.accelerator.unwrap_model(self.model[key]).state_dict() for key in self.model},
                     'optimizer': self.optimizer.state_dict(),
                     'scheduler': self.optimizer.scheduler_state_dict(),
                     'iters': self.iters,
@@ -370,14 +460,17 @@ class Trainer:
                     self.log_dir,
                     f'DiT_epoch_{self.epoch:05d}_step_{self.iters:05d}.pth'
                 )
-                torch.save(state, save_path)
+                self.accelerator.wait_for_everyone()
+                if self.accelerator.is_main_process:
+                    print('Saving..')
+                    torch.save(state, save_path)
 
-                # find all checkpoints and remove old ones
-                checkpoints = glob.glob(os.path.join(self.log_dir, 'DiT_epoch_*.pth'))
-                if len(checkpoints) > 2:
-                    checkpoints.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
-                    for cp in checkpoints[:-2]:
-                        os.remove(cp)
+                    # find all checkpoints and remove old ones
+                    checkpoints = glob.glob(os.path.join(self.log_dir, 'DiT_epoch_*.pth'))
+                    if len(checkpoints) > 2:
+                        checkpoints.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
+                        for cp in checkpoints[:-2]:
+                            os.remove(cp)
 
     def train(self):
         self.ema_loss = 0
@@ -388,14 +481,16 @@ class Trainer:
             if self.iters >= self.max_steps:
                 break
 
-        print('Saving final model..')
-        state = {
-            'net': {key: self.model[key].state_dict() for key in self.model},
-        }
-        os.makedirs(self.log_dir, exist_ok=True)
-        save_path = os.path.join(self.log_dir, 'ft_model.pth')
-        torch.save(state, save_path)
-        print(f"Final model saved at {save_path}")
+        self.accelerator.wait_for_everyone()
+        if self.accelerator.is_main_process:
+            print('Saving final model..')
+            state = {
+                'net': {key: self.accelerator.unwrap_model(self.model[key]).state_dict() for key in self.model},
+            }
+            os.makedirs(self.log_dir, exist_ok=True)
+            save_path = os.path.join(self.log_dir, 'ft_model.pth')
+            torch.save(state, save_path)
+            print(f"Final model saved at {save_path}")
 
 
 def main(args):

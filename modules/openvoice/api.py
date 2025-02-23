@@ -15,8 +15,8 @@ class OpenVoiceBaseClass(object):
     def __init__(self, 
                 config_path, 
                 device='cuda:0'):
-        if 'cuda' in device:
-            assert torch.cuda.is_available()
+        # if 'cuda' in device:
+        #     assert torch.cuda.is_available()
 
         hps = utils.get_hparams_from_file(config_path)
 
@@ -113,7 +113,7 @@ class ToneColorConverter(OpenVoiceBaseClass):
 
     def extract_se(self, waves, wave_lengths):
         
-        device = self.device
+        # device = self.device
         hps = self.hps
         gs = []
         
@@ -122,7 +122,7 @@ class ToneColorConverter(OpenVoiceBaseClass):
             y = y[None, :]
             y = spectrogram_torch(y, hps.data.filter_length,
                                         hps.data.sampling_rate, hps.data.hop_length, hps.data.win_length,
-                                        center=False).to(device)
+                                        center=False)#.to(device)
             with torch.no_grad():
                 g = self.model.ref_enc(y.transpose(1, 2)).unsqueeze(-1)
                 gs.append(g.detach())
@@ -137,7 +137,7 @@ class ToneColorConverter(OpenVoiceBaseClass):
             y = src_waves
             spec = spectrogram_torch(y, hps.data.filter_length,
                                     hps.data.sampling_rate, hps.data.hop_length, hps.data.win_length,
-                                    center=False).to(self.device)
+                                    center=False)#.to(self.device)
             spec_lengths = src_wave_lengths // hps.data.hop_length
             spec_lengths = spec_lengths.clamp(min=1, max=spec.size(2))
             audio = self.model.voice_conversion(spec, spec_lengths, sid_src=src_se.unsqueeze(-1), sid_tgt=tgt_se.unsqueeze(-1), tau=tau)[0]
